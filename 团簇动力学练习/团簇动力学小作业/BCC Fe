@@ -1,73 +1,319 @@
 #吴石老师留的团簇动力学小作业
 #体心立方单晶纯铁在1200℃充分热处理后仅含单空位（热平衡浓度），随后急冷至300℃进行退火。单空位可迁移，
 #不可逆地聚集形成静止的空位团簇（n≥2，不分解），忽略其它缺陷。需计算退火开始1 s内单空位浓度随时间的演化。
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+vacancy_cluster_enhanced.py
+
+空位团簇长大动力学模拟脚本。
+
+功能：
+1. 修正 C1 + C1 -> C2 二聚反应的质量守恒问题；
+2. 使用归一化浓度 x_n = C_n / C_init，提高数值稳定性；
+3. 输出单空位浓度、质量守恒误差、平均团簇尺寸、团簇尺寸分布等图像；
+4. 自动保存 CSV 数据和 PNG 图片。
+
+运行：
+    python vacancy_cluster_enhanced.py
+
+可选：
+    python vacancy_cluster_enhanced.py --nmax 300 --t-end 1.0 --n-eval 200
+"""
+
+import argparse
+from pathlib import Path
+
 import numpy as np
-from scipy.integrate import solve_ivp
+import pandas as pd
 import matplotlib.pyplot as plt
+from scipy.integrate import solve_ivp
 
-# ===== 物理参数 =====
-kB = 8.617333262145e-5   # eV/K
-a0 = 2.86e-10             # m
-Ef = 1.7                  # eV
-Em = 0.67                 # eV
-D0 = 2e-7                 # m^2/s
 
-T1 = 1200 + 273.15        # 1473.15 K
-T2 = 300 + 273.15         # 573.15 K
+def vacancy_radius(n, a0):
+    """n 个空位团簇的等效半径。"""
+    return (3.0 * n / (8.0 * np.pi)) ** (1.0 / 3.0) * a0
 
-N_at = 2.0 / a0**3
-C_init = N_at * np.exp(-Ef / (kB * T1))
 
-D = D0 * np.exp(-Em / (kB * T2))
+def build_capture_coefficients(nmax, a0, diffusion):
+    """
+    构造空位被团簇俘获的反应系数 beta。
 
-def r_n(n):
-    return (3.0 * n / (8.0 * np.pi))**(1.0/3.0) * a0
+    beta[0] 对应 C1 + C1 -> C2。
+    对两个可移动单空位：
+        K11 = 4*pi*(r1+r1)*(D1+D1) = 16*pi*r1*D
+    但 C2 生成速率必须为：
+        J1 = 0.5*K11*C1^2
+    """
+    n_arr = np.arange(1, nmax + 1)
+    r_arr = vacancy_radius(n_arr, a0)
 
-r1 = r_n(1)
+    beta = np.zeros(nmax)
+    r1 = r_arr[0]
 
-Nmax = 500
-beta = np.zeros(Nmax)
-beta[0] = 16.0 * np.pi * r1 * D
-for n in range(2, Nmax + 1):
-    beta[n-1] = 4.0 * np.pi * (r1 + r_n(n)) * D
+    beta[0] = 16.0 * np.pi * r1 * diffusion
 
-# ===== ODE 右端项 =====
-def rhs(t, y):
-    C1 = y[0]
-    dydt = np.zeros(Nmax)
-    loss_sum = beta[0] * C1
-    for i in range(1, Nmax):
-        loss_sum += beta[i] * y[i]
-    dydt[0] = -C1 * loss_sum
+    if nmax > 1:
+        beta[1:] = 4.0 * np.pi * (r1 + r_arr[1:]) * diffusion
 
-    for i in range(1, Nmax - 1):
-        dydt[i] = beta[i-1] * C1 * y[i-1] - beta[i] * C1 * y[i]
-    dydt[Nmax-1] = beta[Nmax-2] * C1 * y[Nmax-2]  # 截断尾部
-    return dydt
+    return beta, r_arr
 
-# ===== 求解 =====
-y0 = np.zeros(Nmax)
-y0[0] = C_init
 
-sol = solve_ivp(rhs, [1e-8, 1.0], y0, method='Radau',
-                t_eval=np.logspace(-8, 0, 200),
-                rtol=1e-8, atol=1e-20)
+def rhs_normalized(t, x, beta, c_init):
+    """
+    归一化浓度形式的速率方程。
+    x[n-1] = C_n / C_init
 
-C1 = sol.y[0, :]
-t = sol.t
+    真实反应通量中有 C1*C_n。
+    归一化后 dx/dt 中保留 beta*C_init*x1*xn。
+    """
+    nmax = x.size
+    x1 = x[0]
+    dxdt = np.zeros_like(x)
 
-# 质量守恒检验
-n_arr = np.arange(1, Nmax + 1)
-total = np.sum(n_arr[:, None] * sol.y, axis=0)
-print(f"质量守恒最大相对误差: {np.max(np.abs(total - C_init))/C_init:.2e}")
+    flux = np.zeros(nmax)
 
-# ===== 绘图与输出 =====
-plt.loglog(t, C1, 'b-', lw=2)
-plt.xlabel('t (s)'); plt.ylabel('C1 (m$^{-3}$)')
-plt.title('300°C 退火单空位浓度演化')
-plt.grid(True, which='both', ls='--')
-plt.show()
+    # C1 + C1 -> C2
+    flux[0] = 0.5 * beta[0] * c_init * x1 * x1
 
-print("     时间(s)         C1 (m^-3)")
-for i in [0, 20, 40, 60, 80, 100, 150, -1]:
-    print(f"{t[i]:.4e}   {C1[i]:.4e}")
+    # C1 + Cn -> C(n+1), n >= 2
+    if nmax > 1:
+        flux[1:] = beta[1:] * c_init * x1 * x[1:]
+
+    # 单空位消耗
+    dxdt[0] = -2.0 * flux[0] - np.sum(flux[1:])
+
+    if nmax == 1:
+        return dxdt
+
+    # C2
+    if nmax == 2:
+        dxdt[1] = flux[0]
+    else:
+        dxdt[1] = flux[0] - flux[1]
+
+        # C3 到 C(Nmax-1)
+        if nmax > 3:
+            dxdt[2:-1] = flux[1:-2] - flux[2:-1]
+
+        # 最大尺寸作为尾部累积箱
+        dxdt[-1] = flux[-2]
+
+    return dxdt
+
+
+def compute_observables(sol, c_init, nmax):
+    """计算后处理量。"""
+    x = np.maximum(sol.y, 0.0)
+    c = x * c_init
+    t = sol.t
+    n_arr = np.arange(1, nmax + 1)
+
+    total_vacancy_norm = np.sum(n_arr[:, None] * x, axis=0)
+    rel_mass_error = total_vacancy_norm - 1.0
+
+    c1 = c[0, :]
+    cluster_number_all = np.sum(c, axis=0)
+
+    if nmax > 1:
+        cluster_number_excluding_monomer = np.sum(c[1:, :], axis=0)
+        mass_in_clusters_excluding_monomer = np.sum(n_arr[1:, None] * c[1:, :], axis=0)
+    else:
+        cluster_number_excluding_monomer = np.zeros_like(t)
+        mass_in_clusters_excluding_monomer = np.zeros_like(t)
+
+    total_vacancy = total_vacancy_norm * c_init
+
+    mean_size_all = total_vacancy / np.maximum(cluster_number_all, 1e-300)
+    mean_size_clusters = mass_in_clusters_excluding_monomer / np.maximum(
+        cluster_number_excluding_monomer, 1e-300
+    )
+
+    tail_mass_fraction = nmax * c[-1, :] / np.maximum(total_vacancy, 1e-300)
+
+    return {
+        "t": t,
+        "x": x,
+        "c": c,
+        "n_arr": n_arr,
+        "C1": c1,
+        "total_vacancy": total_vacancy,
+        "rel_mass_error": rel_mass_error,
+        "cluster_number_all": cluster_number_all,
+        "cluster_number_excluding_monomer": cluster_number_excluding_monomer,
+        "mean_size_all": mean_size_all,
+        "mean_size_clusters": mean_size_clusters,
+        "tail_mass_fraction": tail_mass_fraction,
+    }
+
+
+def save_csv(obs, outdir):
+    """保存 CSV 数据。"""
+    outdir = Path(outdir)
+
+    summary = pd.DataFrame({
+        "time_s": obs["t"],
+        "C1_m^-3": obs["C1"],
+        "total_vacancy_m^-3": obs["total_vacancy"],
+        "relative_mass_error": obs["rel_mass_error"],
+        "cluster_number_all_m^-3": obs["cluster_number_all"],
+        "cluster_number_excluding_monomer_m^-3": obs["cluster_number_excluding_monomer"],
+        "mean_size_all": obs["mean_size_all"],
+        "mean_size_clusters_excluding_monomer": obs["mean_size_clusters"],
+        "tail_mass_fraction": obs["tail_mass_fraction"],
+    })
+
+    summary.to_csv(outdir / "time_series_summary.csv", index=False)
+
+    final_distribution = pd.DataFrame({
+        "cluster_size_n": obs["n_arr"],
+        "concentration_m^-3": obs["c"][:, -1],
+        "normalized_concentration": obs["x"][:, -1],
+        "vacancy_mass_m^-3": obs["n_arr"] * obs["c"][:, -1],
+    })
+
+    final_distribution.to_csv(outdir / "final_cluster_distribution.csv", index=False)
+
+
+def plot_results(obs, outdir):
+    """绘制后处理图片。"""
+    outdir = Path(outdir)
+    t = obs["t"]
+    c = obs["c"]
+    n_arr = obs["n_arr"]
+
+    selected_indices = sorted(set([0, len(t)//4, len(t)//2, 3*len(t)//4, len(t)-1]))
+
+    plt.figure(figsize=(6.2, 4.4))
+    plt.loglog(t, obs["C1"], lw=2)
+    plt.xlabel("Time, t (s)")
+    plt.ylabel(r"Monovacancy concentration, $C_1$ (m$^{-3}$)")
+    plt.title("Evolution of monovacancy concentration")
+    plt.grid(True, which="both", ls="--", alpha=0.5)
+    plt.tight_layout()
+    plt.savefig(outdir / "01_C1_vs_time.png", dpi=300)
+    plt.close()
+
+    plt.figure(figsize=(6.2, 4.4))
+    plt.semilogx(t, np.abs(obs["rel_mass_error"]), lw=2)
+    plt.xlabel("Time, t (s)")
+    plt.ylabel("Absolute relative mass error")
+    plt.title("Mass conservation check")
+    plt.grid(True, which="both", ls="--", alpha=0.5)
+    plt.tight_layout()
+    plt.savefig(outdir / "02_mass_conservation_error.png", dpi=300)
+    plt.close()
+
+    plt.figure(figsize=(6.2, 4.4))
+    plt.semilogx(t, obs["mean_size_all"], lw=2, label="All vacancy objects")
+    plt.semilogx(t, obs["mean_size_clusters"], lw=2, ls="--", label="Clusters, n >= 2")
+    plt.xlabel("Time, t (s)")
+    plt.ylabel("Mean cluster size")
+    plt.title("Mean cluster size evolution")
+    plt.grid(True, which="both", ls="--", alpha=0.5)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(outdir / "03_mean_cluster_size.png", dpi=300)
+    plt.close()
+
+    plt.figure(figsize=(6.8, 4.8))
+    for idx in selected_indices:
+        concentration = c[:, idx]
+        valid = concentration > 0
+        plt.loglog(n_arr[valid], concentration[valid], lw=1.8, label=f"t={t[idx]:.2e} s")
+    plt.xlabel("Cluster size, n")
+    plt.ylabel(r"Concentration, $C_n$ (m$^{-3}$)")
+    plt.title("Cluster size distribution")
+    plt.grid(True, which="both", ls="--", alpha=0.5)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(outdir / "04_cluster_size_distribution.png", dpi=300)
+    plt.close()
+
+    plt.figure(figsize=(6.2, 4.4))
+    plt.semilogx(t, obs["tail_mass_fraction"], lw=2)
+    plt.xlabel("Time, t (s)")
+    plt.ylabel("Tail mass fraction at Nmax")
+    plt.title("Truncation risk indicator")
+    plt.grid(True, which="both", ls="--", alpha=0.5)
+    plt.tight_layout()
+    plt.savefig(outdir / "05_tail_mass_fraction.png", dpi=300)
+    plt.close()
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Vacancy cluster growth simulation with post-processing.")
+    parser.add_argument("--nmax", type=int, default=500, help="Maximum cluster size.")
+    parser.add_argument("--t-start", type=float, default=1e-8, help="Start time in seconds.")
+    parser.add_argument("--t-end", type=float, default=1.0, help="End time in seconds.")
+    parser.add_argument("--n-eval", type=int, default=200, help="Number of logarithmic output points.")
+    parser.add_argument("--method", type=str, default="BDF", choices=["BDF", "Radau", "LSODA"], help="ODE solver.")
+    parser.add_argument("--rtol", type=float, default=1e-7, help="Relative tolerance.")
+    parser.add_argument("--atol", type=float, default=1e-12, help="Absolute tolerance for normalized concentration.")
+    parser.add_argument("--outdir", type=str, default="vacancy_cluster_results", help="Output directory.")
+    args = parser.parse_args()
+
+    # 物理参数
+    kB = 8.617333262145e-5   # eV/K
+    a0 = 2.86e-10             # m
+    Ef = 1.7                  # eV
+    Em = 0.67                 # eV
+    D0 = 2e-7                 # m^2/s
+
+    T_quench_source = 1200.0 + 273.15   # K
+    T_anneal = 300.0 + 273.15           # K
+
+    # bcc Fe 原子数密度近似：每个晶胞 2 个原子
+    N_at = 2.0 / a0**3
+    C_init = N_at * np.exp(-Ef / (kB * T_quench_source))
+    D = D0 * np.exp(-Em / (kB * T_anneal))
+
+    beta, _ = build_capture_coefficients(args.nmax, a0, D)
+
+    x0 = np.zeros(args.nmax)
+    x0[0] = 1.0
+
+    t_eval = np.logspace(np.log10(args.t_start), np.log10(args.t_end), args.n_eval)
+
+    sol = solve_ivp(
+        fun=lambda t, x: rhs_normalized(t, x, beta, C_init),
+        t_span=(args.t_start, args.t_end),
+        y0=x0,
+        method=args.method,
+        t_eval=t_eval,
+        rtol=args.rtol,
+        atol=args.atol,
+    )
+
+    if not sol.success:
+        raise RuntimeError(f"ODE solver failed: {sol.message}")
+
+    outdir = Path(args.outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    obs = compute_observables(sol, C_init, args.nmax)
+    save_csv(obs, outdir)
+    plot_results(obs, outdir)
+
+    max_rel_mass_error = np.max(np.abs(obs["rel_mass_error"]))
+    final_tail_fraction = obs["tail_mass_fraction"][-1]
+
+    print("===== Simulation completed =====")
+    print(f"Nmax                         : {args.nmax}")
+    print(f"Initial vacancy concentration: {C_init:.6e} m^-3")
+    print(f"Diffusion coefficient        : {D:.6e} m^2/s")
+    print(f"Solver                       : {args.method}")
+    print(f"rtol, atol                   : {args.rtol:.1e}, {args.atol:.1e}")
+    print(f"Max relative mass error      : {max_rel_mass_error:.6e}")
+    print(f"Final C1                     : {obs['C1'][-1]:.6e} m^-3")
+    print(f"Final mean cluster size n>=2 : {obs['mean_size_clusters'][-1]:.6e}")
+    print(f"Final tail mass fraction     : {final_tail_fraction:.6e}")
+
+    if final_tail_fraction > 1e-3:
+        print("WARNING: Tail mass fraction is larger than 1e-3. Consider increasing --nmax.")
+
+    print(f"Results saved to             : {outdir.resolve()}")
+
+
+if __name__ == "__main__":
+    main()
