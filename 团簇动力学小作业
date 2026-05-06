@@ -1,0 +1,70 @@
+import numpy as np
+from scipy.integrate import solve_ivp
+import matplotlib.pyplot as plt
+
+# ===== 物理参数 =====
+kB = 8.617333262145e-5   # eV/K
+a0 = 2.86e-10             # m
+Ef = 1.7                  # eV
+Em = 0.67                 # eV
+D0 = 2e-7                 # m^2/s
+
+T1 = 1200 + 273.15        # 1473.15 K
+T2 = 300 + 273.15         # 573.15 K
+
+N_at = 2.0 / a0**3
+C_init = N_at * np.exp(-Ef / (kB * T1))
+
+D = D0 * np.exp(-Em / (kB * T2))
+
+def r_n(n):
+    return (3.0 * n / (8.0 * np.pi))**(1.0/3.0) * a0
+
+r1 = r_n(1)
+
+Nmax = 500
+beta = np.zeros(Nmax)
+beta[0] = 16.0 * np.pi * r1 * D
+for n in range(2, Nmax + 1):
+    beta[n-1] = 4.0 * np.pi * (r1 + r_n(n)) * D
+
+# ===== ODE 右端项 =====
+def rhs(t, y):
+    C1 = y[0]
+    dydt = np.zeros(Nmax)
+    loss_sum = beta[0] * C1
+    for i in range(1, Nmax):
+        loss_sum += beta[i] * y[i]
+    dydt[0] = -C1 * loss_sum
+
+    for i in range(1, Nmax - 1):
+        dydt[i] = beta[i-1] * C1 * y[i-1] - beta[i] * C1 * y[i]
+    dydt[Nmax-1] = beta[Nmax-2] * C1 * y[Nmax-2]  # 截断尾部
+    return dydt
+
+# ===== 求解 =====
+y0 = np.zeros(Nmax)
+y0[0] = C_init
+
+sol = solve_ivp(rhs, [1e-8, 1.0], y0, method='Radau',
+                t_eval=np.logspace(-8, 0, 200),
+                rtol=1e-8, atol=1e-20)
+
+C1 = sol.y[0, :]
+t = sol.t
+
+# 质量守恒检验
+n_arr = np.arange(1, Nmax + 1)
+total = np.sum(n_arr[:, None] * sol.y, axis=0)
+print(f"质量守恒最大相对误差: {np.max(np.abs(total - C_init))/C_init:.2e}")
+
+# ===== 绘图与输出 =====
+plt.loglog(t, C1, 'b-', lw=2)
+plt.xlabel('t (s)'); plt.ylabel('C1 (m$^{-3}$)')
+plt.title('300°C 退火单空位浓度演化')
+plt.grid(True, which='both', ls='--')
+plt.show()
+
+print("     时间(s)         C1 (m^-3)")
+for i in [0, 20, 40, 60, 80, 100, 150, -1]:
+    print(f"{t[i]:.4e}   {C1[i]:.4e}")
